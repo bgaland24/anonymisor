@@ -1,0 +1,135 @@
+# ============================================================
+#  Fichier de correspondances de REFERENCE — anonymiseur.py
+#  Format : terme_original<TAB>remplacement   (lignes vides / # ignorees)
+# ------------------------------------------------------------
+#  Curé à partir de "correspondances_Dossier test.tsv".
+#  Ne sont conservés que les noms IDENTIFIANTS. Les mots courants,
+#  les codes de champ Word (PAGEREF, MERGEFORMAT) et les acronymes
+#  techniques génériques (SI, API, SQL, RAM, CPU, France...) ont été
+#  retirés. AJUSTE les pseudonymes / décommente selon ton besoin.
+#
+#  CASSE : par défaut le script est INSENSIBLE à la casse → une seule
+#  entrée "SEMAE" couvre aussi "Semae"/"semae". La colonne de droite
+#  est écrite TELLE QUELLE. N'ajoute pas d'acronyme coïncidant avec un
+#  mot courant sauf en lançant avec --case-sensitive.
+# ============================================================
+
+# --- Liens / URLs (motifs regex, préfixe "re:") -------------
+#  La règle SharePoint (plus longue) est appliquée AVANT la règle
+#  générique https://semae* (tri automatique par longueur).
+#  Le motif SharePoint capture aussi les espaces d'une URL collée.*
+
+re:https?://semaefrance\.sharepoint\.com[^\r\n"<>]*	[LIEN OUTIL COLLABORATIF]
+re:https?://semae[^\s"'<>)]*	[LIEN OUTIL]
+
+# --- Organisation Principale ------
+SEMAE	[ORG-S]
+GNIS	[ORG-S]
+SEMAE                       PAGEREF		[ORG-S]
+DQCO    [SERVICE-D]
+DSF [SERVICE-S]
+DAFI    [SERVICE-A]
+
+
+# --- Entités liés ------
+
+GEVES	[ORG-G]
+SOCFrance	[MARQUE1]
+SOC France	[MARQUE1]
+Direction de la Qualité et du Contrôle Officiel [FONCTION-SURVEILLANCE]
+Contrôle Officiel [FONCTION-SURVEILLANCE]
+INRAE	[ORG-I]
+FranceAgriMer	[ORG-FM]
+OCDE	[ORG-E]
+Ministère des Armées	[ORG-A]
+Ministère de l'Agriculture	[ORG-MA]
+
+
+# --- Termes spécifique  ---------------------
+Semence [PRODUIT]
+Semences [PRODUIT]
+
+# --- Noms Propres  ---------------------
+Servanne HENNEQUIN [PERSONNE-SHN]
+Servanne [PERSONNE-SHN]
+Bastien Galand [PERSONNE-BGD]
+Bastien [PERSONNE-BGD]
+Eric MICHAUD [PERSONNE-EMD]
+Eric [PERSONNE-EMD]
+Anne-Laure FONDEUR [PERSONNE-AFR]
+Anne Laure FONDEUR [PERSONNE-AFR]
+FONDEUR [PERSONNE-AFR]
+bruno Ferreira [PERSONNE-BFA]
+Ferreira [PERSONNE-BFA]
+bruno [PERSONNE-BFA]
+Franck PRUNUS [PERSONNE-FPS]
+PRUNUS [PERSONNE-FPS]
+Patricia Guillamot  [PERSONNE-PGT]
+Guillamot [PERSONNE-PGT]
+Patricia    [PERSONNE-PGT]
+Michel STRAEBLER [PERSONNE-MSR]
+STRAEBLER [PERSONNE-MSR]
+Michel [PERSONNE-MSR]
+David DOOZE [PERSONNE-DDE]
+DOOZE [PERSONNE-DDE]
+David [PERSONNE-DDE]
+
+# --- Prestataires / éditeurs / cabinets ---------------------
+Hardis Group	[PRESTA-H]
+HARDIS	[PRESTA-H]
+ISIA	[PRESTA-I]
+TASMANE	[PRESTA-T]
+Gartner	[PRESTA-G]
+CGI	[PRESTA-C]
+Capgemini	[PRESTA-CA]
+Orange Business Services	[PRESTA-O]
+
+
+
+# --- Produits / solutions du marché cités -------------------
+
+FISEM	[APPLI-F]
+Certisem	[APPLI-C]
+Prelsem	[APPLI-P]
+EPAD	[APPLI-E]
+Simplicité	[APPLI-S]
+Selligent	[APPLI-CRM]
+Panda Doc	[APPLI-SIGNATURE]
+PandaDoc	[APPLI-SIGNATURE]
+VDOC	[APPLI-GED]
+Sage	[APPLI-ERP]
+SageX3	[APPLI-ERP]
+Sage X3	[APPLI-ERP]
+ERP Sage	[APPLI-ERP]
+ERP SageX3	[APPLI-ERP]
+ERP Sage X3	[APPLI-ERP]
+Marketo Engage	[APPLI-MARKET]
+Marketo	[APPLI-MARKET]
+Sphinx	[APPLI-ENQUETE]
+Esker	[APPLI-DEMAT]
+Everial	[APPLI-GED2]
+ISIATIV	[APPLI-GED3]
+VISIATIV	[APPLI-GED3]
+Lucca	[APPLI-RH]
+
+IBMi	[APPLI-LEGACY-I]
+AS400	[APPLI-LEGACY_A]
+
+Talend	[OUTIL-ETL]
+Red Hat		[OUTIL-RH]
+Windows Server [OUTIL-WS]
+Logstash    [OUTIL-LS]
+Log stash   [OUTIL-LS]
+Fluent Bit  [OUTIL-FB]
+FluentBit [OUTIL-FB]
+Elastik [OUTIL-EK]
+PostgreSQL  [OUTIL-PS]
+Tomcat [OUTIL-TC]
+tomcat.apache   [OUTIL-TC]
+Nginx	[OUTIL-NW]
+Filebeat	[OUTIL-FI]
+Grafana	[OUTIL-MG]
+Angular	[OUTIL-FO]
+docker [OUTIL-DR]
+karaf.apache [OUTIL-KF]
+karaf [OUTIL-KF]
