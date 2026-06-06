@@ -1,0 +1,27 @@
+# --------------------------------------------------------------------------- #
+#  Données confidentielles — NE JAMAIS publier sur GitHub
+# --------------------------------------------------------------------------- #
+# Documents originaux (non anonymisés) et résultats internes
+/Dossier test/
+/Dossier résultat/
+
+# Fichiers de scan / correspondances générés (candidats, contiennent des termes réels)
+/Scan/
+
+# Exception explicite : la table de correspondance de référence reste suivie.
+!correspondances_reference.tsv
+
+# --------------------------------------------------------------------------- #
+#  Archives et sauvegardes
+# --------------------------------------------------------------------------- #
+anonymiseur.zip
+backup.tsv
+*.bak
+
+# --------------------------------------------------------------------------- #
+#  Artefacts Python / PyInstaller
+# --------------------------------------------------------------------------- #
+__pycache__/
+*.pyc
+/build/
+/dist/
