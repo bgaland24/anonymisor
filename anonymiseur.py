@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-anonymiseur.py — Anonymisation par lot de documents .txt / .md / .docx / .pptx / .xlsx
+anonymiseur.py — Anonymisation par lot .txt / .md / .docx / .pptx / .xlsx / .pdf
 
 Objectif : remplacer des noms propres identifiants (organisations, personnes,
 prestataires, produits) par des pseudonymes/jetons définis dans un fichier de
@@ -34,22 +34,30 @@ LIMITES HONNÊTES
   LibreOffice, AVANT de passer le script.
 - Les .doc / .ppt hérités (binaires) ne sont PAS traités : les convertir
   d'abord en .docx / .pptx (LibreOffice : soffice --convert-to docx fichier.doc).
+- Les .pdf sont convertis en .docx via Microsoft Word (dépendance OPTIONNELLE
+  pywin32 + Word installé) puis durcis comme un .docx. Un PDF SCANNÉ (image de
+  texte) donnera une sortie « blanche » : son texte est dans les pixels, non
+  anonymisable sans OCR.
 - Ce script neutralise les noms ; il ne neutralise PAS le contexte métier
   (secteur, taille, budget, stack legacy) sauf si tu ajoutes ces expressions
   dans le fichier de correspondances. Le contexte seul peut rester identifiant.
 """
 
 import argparse
+import base64
 import csv
+import glob
 import os
 import re
 import shutil
 import sys
+import types
 import zipfile
 from collections import Counter
 
 TEXT_EXT = {".txt", ".md", ".markdown"}
 OFFICE_EXT = {".docx", ".pptx", ".xlsx"}
+PDF_EXT = {".pdf"}
 LEGACY_EXT = {".doc", ".ppt", ".xls"}
 
 # Fichiers qui n'ont pas pu être lus (verrouillés, OneDrive hors-ligne, corrompus).
@@ -196,25 +204,35 @@ def construire_scrubbers(args):
 # --------------------------------------------------------------------------- #
 def remplacer_texte(texte, termes, scrubbers, compteur):
     """Ordre d'application, dans cet ordre précis :
-      1) règles REGEX du fichier (re:) — les plus spécifiques (ex. URLs) ;
-      2) SCRUBBERS techniques (email, url, ip, mac, port, chemin) ;
-      3) termes EXACTS du fichier.
-    Les scrubbers passent AVANT les termes exacts pour qu'un terme (ex. SEMAE)
-    ne fragmente pas un email/URL et n'empêche pas sa détection
-    (ex. « x@semae.fr » doit devenir « [EMAIL] », pas « x@[ORG-S].fr »)."""
-    # 1) Règles regex (re:)
+      1) scrubber EMAIL — un email est un bloc atomique : on le neutralise EN
+         PREMIER, pour qu'aucune règle ne casse son domaine
+         (« x@semae.fr » doit devenir « [EMAIL] », pas « x@[ORG-S].fr ») ;
+      2) règles REGEX du fichier (re:) — ex. URLs internes ;
+      3) autres scrubbers (url, ip, mac, port, chemin) ;
+      4) termes EXACTS du fichier.
+    """
+    # 1) Email d'abord (bloc atomique)
+    for nom, motif, repl in scrubbers:
+        if nom != "email":
+            continue
+        texte, n = motif.subn(repl, texte)
+        if n:
+            compteur[f"<{nom}>"] += n
+    # 2) Règles regex (re:)
     for orig, motif, repl, est_regex in termes:
         if not est_regex:
             continue
         texte, n = motif.subn(repl.replace("\\", "\\\\"), texte)
         if n:
             compteur[orig] += n
-    # 2) Scrubbers techniques
+    # 3) Autres scrubbers techniques (url, ip, mac, port, chemin)
     for nom, motif, repl in scrubbers:
+        if nom == "email":
+            continue
         texte, n = motif.subn(repl, texte)
         if n:
             compteur[f"<{nom}>"] += n
-    # 3) Termes exacts (littéraux)
+    # 4) Termes exacts (littéraux)
     for orig, motif, repl, est_regex in termes:
         if est_regex:
             continue
@@ -304,34 +322,16 @@ def _nettoyer_liens_rels(xml, termes, scrubbers, compteur):
     return _RE_TARGET_LIEN.sub(repl, xml)
 
 
-def _vider_balises(xml, tags):
-    """Vide le contenu textuel de balises données : <tag ...>X</tag> -> <tag .../>."""
-    for tag in tags:
-        t = re.escape(tag)
-        xml = re.sub(rf"(<{t}(?:\s[^>]*)?>).*?(</{t}>)", r"\1\2", xml, flags=re.DOTALL)
-    return xml
-
-
-def _nettoyer_metadonnees(membre, xml, neutraliser_dates):
-    """core.xml / app.xml / custom.xml : retire les champs identifiants."""
-    base = membre.rsplit("/", 1)[-1]
-    if base == "core.xml":
-        xml = _vider_balises(xml, [
-            "dc:creator", "cp:lastModifiedBy", "dc:title", "dc:subject",
-            "cp:keywords", "dc:description", "cp:category", "cp:contentStatus",
-        ])
-        if neutraliser_dates:
-            xml = _vider_balises(xml, ["dcterms:created", "dcterms:modified",
-                                       "cp:lastPrinted"])
-    elif base == "app.xml":
-        xml = _vider_balises(xml, ["Company", "Manager"])
-    elif base == "custom.xml":
-        # Valeurs de propriétés personnalisées
-        xml = _vider_balises(xml, ["vt:lpwstr", "vt:i4", "vt:filetime", "vt:bool"])
-    return xml
-
-
-# Membres à supprimer entièrement (commentaires, miniatures, personnes)
+# Membres à supprimer entièrement (commentaires, miniatures, personnes,
+# objets OLE embarqués, ET propriétés du document : on retire core/app/custom
+# plutôt que de les vider — la partie n'existe plus, donc zéro champ résiduel.
+# Word régénère un minimum à la prochaine sauvegarde.)
+#
+# Objets OLE (word/ppt/xl + /embeddings/) : ce sont des fichiers embarqués —
+# souvent un Excel/Word ENTIER avec ses PROPRES métadonnées et données — que
+# l'anonymiseur ne sait pas ouvrir récursivement. On les supprime donc en bloc.
+# Leur aperçu (image) est traité par ailleurs ; la référence <o:OLEObject>
+# restante est tolérée par Word (objet « non disponible »).
 def _membre_a_supprimer(nom):
     n = nom.lower()
     motifs = (
@@ -340,9 +340,123 @@ def _membre_a_supprimer(nom):
         "ppt/comments/", "ppt/authors.xml", "ppt/cmauthors.xml",
         "xl/comments", "xl/threadedcomments/", "xl/persons/",
         "docprops/thumbnail",
+        "docprops/core.xml", "docprops/app.xml", "docprops/custom.xml",
+        "word/embeddings/", "ppt/embeddings/", "xl/embeddings/",
     )
     return any(n.startswith(p) or n == p for p in motifs) or \
         ("/comments" in n and n.endswith(".xml") and "ppt/" in n)
+
+
+# --------------------------------------------------------------------------- #
+#  Images : suppression (défaut) ou strip des métadonnées (--garder-images)
+# --------------------------------------------------------------------------- #
+_IMG_EXT = {".png", ".jpg", ".jpeg", ".gif", ".bmp", ".tif", ".tiff",
+            ".emf", ".wmf", ".svg", ".ico", ".webp"}
+_RE_MEDIA = re.compile(r"(?:word|ppt|xl)/(?:[^/]+/)*media/", re.IGNORECASE)
+
+# Placeholders 1×1 SANS métadonnée. Remplacer les octets d'origine (au lieu de
+# retirer la partie) garde le document structurellement valide : les références
+# r:embed restent résolues, on évite les images « cassées ». Le PNG transparent
+# sert de substitut universel (Word décode d'après le contenu, pas l'extension).
+_PH_PNG = base64.b64decode(
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk"
+    "+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==")
+_PH_GIF = base64.b64decode(
+    "R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7")
+_PH_SVG = b'<svg xmlns="http://www.w3.org/2000/svg" width="1" height="1"/>'
+
+
+def _est_media_image(nom):
+    return bool(_RE_MEDIA.search(nom)) and \
+        os.path.splitext(nom)[1].lower() in _IMG_EXT
+
+
+def _placeholder_image(nom):
+    ext = os.path.splitext(nom)[1].lower()
+    if ext == ".gif":
+        return _PH_GIF
+    if ext == ".svg":
+        return _PH_SVG
+    return _PH_PNG
+
+
+def _strip_jpeg(data):
+    """Retire les segments porteurs de métadonnées : APP1 (EXIF/XMP),
+    APP13 (IPTC/Photoshop) et COM (commentaire). Conserve l'image."""
+    if data[:2] != b"\xff\xd8":
+        return data
+    out = bytearray(b"\xff\xd8")
+    i, n = 2, len(data)
+    drop = {0xE1, 0xED, 0xFE}   # APP1, APP13, COM
+    while i + 1 < n:
+        if data[i] != 0xFF:
+            out += data[i:]
+            break
+        marker = data[i + 1]
+        if marker in (0xD9, 0xDA):        # EOI / début des données compressées
+            out += data[i:]
+            break
+        if 0xD0 <= marker <= 0xD7 or marker in (0x00, 0x01):
+            out += data[i:i + 2]
+            i += 2
+            continue
+        if i + 3 >= n:
+            out += data[i:]
+            break
+        seg_end = i + 2 + ((data[i + 2] << 8) | data[i + 3])
+        if seg_end > n:
+            out += data[i:]
+            break
+        if marker not in drop:
+            out += data[i:seg_end]
+        i = seg_end
+    return bytes(out)
+
+
+def _strip_png(data):
+    """Retire les chunks de métadonnées : tEXt/zTXt/iTXt (texte, XMP),
+    eXIf (EXIF) et tIME (horodatage). Conserve l'image."""
+    sig = b"\x89PNG\r\n\x1a\n"
+    if data[:8] != sig:
+        return data
+    out = bytearray(sig)
+    i, n = 8, len(data)
+    drop = {b"tEXt", b"zTXt", b"iTXt", b"eXIf", b"tIME"}
+    while i + 8 <= n:
+        length = int.from_bytes(data[i:i + 4], "big")
+        ctype = data[i + 4:i + 8]
+        chunk_end = i + 12 + length
+        if chunk_end > n:
+            out += data[i:]
+            break
+        if ctype not in drop:
+            out += data[i:chunk_end]
+        i = chunk_end
+        if ctype == b"IEND":
+            break
+    return bytes(out)
+
+
+def _stripper_image(nom, data):
+    """Strip best-effort des métadonnées d'une image, sans la corrompre :
+    en cas d'imprévu on renvoie les octets d'origine."""
+    ext = os.path.splitext(nom)[1].lower()
+    try:
+        if ext in (".jpg", ".jpeg"):
+            return _strip_jpeg(data)
+        if ext == ".png":
+            return _strip_png(data)
+    except Exception:
+        return data
+    return data   # gif/bmp/tif/emf/wmf/svg/… : laissés tels quels
+
+
+def _zinfo_neutre(nom):
+    """ZipInfo à horodatage fixe : empêche les dates réelles de chaque membre
+    de survivre dans la structure de l'archive (fuite indépendante du XML)."""
+    zi = zipfile.ZipInfo(nom, date_time=(1980, 1, 1, 0, 0, 0))
+    zi.compress_type = zipfile.ZIP_DEFLATED
+    return zi
 
 
 def traiter_office(src, dst, termes, scrubbers, args):
@@ -373,23 +487,36 @@ def traiter_office(src, dst, termes, scrubbers, args):
                 continue
             data = zin.read(nom)
 
+            # 0) Images : supprimées par défaut (placeholder 1×1 vierge pour
+            #    garder le document valide), ou conservées mais strippées de
+            #    leurs métadonnées (EXIF/XMP/IPTC…) si --garder-images.
+            if _est_media_image(nom):
+                if getattr(args, "garder_images", False):
+                    data = _stripper_image(nom, data)
+                else:
+                    data = _placeholder_image(nom)
+                zout.writestr(_zinfo_neutre(nom), data)
+                continue
+
             est_xml = nom.lower().endswith((".xml", ".rels"))
             if est_xml:
                 try:
                     xml = data.decode("utf-8")
                 except UnicodeDecodeError:
-                    zout.writestr(info, data)
+                    zout.writestr(_zinfo_neutre(nom), data)
                     continue
 
-                # 1) Métadonnées
-                if "docprops/" in nom.lower():
-                    xml = _nettoyer_metadonnees(nom, xml, args.neutraliser_dates)
-                # 2) Suivi de modifications (document Word)
+                # 1) Suivi de modifications (document Word)
                 if nom.lower().endswith("word/document.xml") or \
                         re.search(r"word/(header|footer)\d*\.xml$", nom.lower()):
                     if not args.garder_suivi:
                         xml = _accepter_suivi_modifs(xml)
                     xml = _supprimer_marqueurs_commentaires(xml)
+                # 1b) Identifiants de session de sauvegarde (corrélation
+                #     inter-documents) : on retire le registre central des rsid.
+                if nom.lower().endswith("word/settings.xml"):
+                    xml = re.sub(r"<w:rsids>.*?</w:rsids>", "", xml,
+                                 flags=re.DOTALL)
                 # 3) Nettoyage des références aux membres supprimés
                 if nom.lower().endswith(".rels"):
                     for b in base_supprimes:
@@ -404,9 +531,9 @@ def traiter_office(src, dst, termes, scrubbers, args):
                 # 4b) Cibles des hyperliens (attributs Target dans les .rels)
                 if nom.lower().endswith(".rels"):
                     xml = _nettoyer_liens_rels(xml, termes, scrubbers, compteur)
-                zout.writestr(info, xml.encode("utf-8"))
+                zout.writestr(_zinfo_neutre(nom), xml.encode("utf-8"))
             else:
-                zout.writestr(info, data)
+                zout.writestr(_zinfo_neutre(nom), data)
     return compteur
 
 
@@ -419,6 +546,21 @@ def extraire_texte(chemin):
         if ext in TEXT_EXT:
             with open(chemin, encoding="utf-8", errors="replace") as f:
                 return f.read()
+        if ext in PDF_EXT:
+            # PDF : converti en .docx (Word) puis lu comme un .docx. Sert au
+            # mode SCAN comme à la simulation. Retourne "" si Word indisponible.
+            import tempfile
+            tmp = tempfile.mktemp(suffix=".docx")
+            if not pdf_vers_docx(chemin, tmp):
+                NON_LUS.append(chemin)
+                return ""
+            try:
+                return extraire_texte(tmp)
+            finally:
+                try:
+                    os.remove(tmp)
+                except OSError:
+                    pass
         if ext in OFFICE_EXT:
             morceaux = []
             with zipfile.ZipFile(chemin) as z:
@@ -446,6 +588,148 @@ def extraire_texte(chemin):
         NON_LUS.append(chemin)
         return ""
     return ""
+
+
+# --------------------------------------------------------------------------- #
+#  PDF — conversion en .docx via Microsoft Word (COM / pywin32)
+#
+#  DÉPENDANCE OPTIONNELLE : ce bloc n'est sollicité QUE si le lot contient des
+#  PDF. Il exige Microsoft Word installé + le paquet « pywin32 »
+#  (pip install pywin32). Le PDF est converti en .docx, qui passe ensuite par
+#  tout le durcissement Office habituel (métadonnées, OLE, images, termes…).
+#
+#  LIMITE : un PDF SCANNÉ (image de texte, sans couche texte) se convertit en
+#  pages-images ; l'anonymiseur retirera ces images (sortie « blanche »), car
+#  le texte incrusté dans les pixels n'est pas anonymisable sans OCR.
+# --------------------------------------------------------------------------- #
+_WORD_APP = None       # instance Word réutilisée sur tout le lot (coûteux à lancer)
+_WORD_VERSION = None   # ex. "16.0" — sert à cibler la bonne clé de registre
+_PDF_REG_BACKUP = None  # (existait: bool, ancienne_valeur | None) pour restauration
+
+
+def _popup_pdf_off(version):
+    """Coche « Ne plus afficher » du dialogue « Word va convertir ce PDF » via la
+    clé de registre HKCU\\...\\Word\\Options\\DisableConvertPdfWarning, en
+    mémorisant l'état initial pour le restaurer ensuite (Word non altéré)."""
+    global _PDF_REG_BACKUP
+    try:
+        import winreg
+        path = rf"Software\Microsoft\Office\{version}\Word\Options"
+        key = winreg.CreateKey(winreg.HKEY_CURRENT_USER, path)
+        try:
+            _PDF_REG_BACKUP = (True, winreg.QueryValueEx(key, "DisableConvertPdfWarning")[0])
+        except FileNotFoundError:
+            _PDF_REG_BACKUP = (False, None)
+        winreg.SetValueEx(key, "DisableConvertPdfWarning", 0, winreg.REG_DWORD, 1)
+        winreg.CloseKey(key)
+    except Exception:
+        _PDF_REG_BACKUP = None   # registre inaccessible : on n'a rien changé
+
+
+def _popup_pdf_restaurer(version):
+    """Restaure la valeur d'origine de DisableConvertPdfWarning."""
+    global _PDF_REG_BACKUP
+    if _PDF_REG_BACKUP is None:
+        return
+    try:
+        import winreg
+        path = rf"Software\Microsoft\Office\{version}\Word\Options"
+        key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, path, 0, winreg.KEY_SET_VALUE)
+        existait, val = _PDF_REG_BACKUP
+        if existait:
+            winreg.SetValueEx(key, "DisableConvertPdfWarning", 0, winreg.REG_DWORD, int(val))
+        else:
+            try:
+                winreg.DeleteValue(key, "DisableConvertPdfWarning")
+            except FileNotFoundError:
+                pass
+        winreg.CloseKey(key)
+    except Exception:
+        pass
+    finally:
+        _PDF_REG_BACKUP = None
+
+
+def _word_app():
+    """Retourne une instance Word automation, créée à la demande. Lève
+    ImportError si pywin32 manque, ou une autre exception si Word est absent."""
+    global _WORD_APP, _WORD_VERSION
+    if _WORD_APP is None:
+        import win32com.client as win32   # pywin32 : dépendance optionnelle
+        app = win32.DispatchEx("Word.Application")   # instance isolée et neuve
+        app.Visible = False
+        try:
+            app.DisplayAlerts = 0          # wdAlertsNone : pas de boîte de dialogue
+        except Exception:
+            pass
+        try:
+            _WORD_VERSION = str(app.Version)            # ex. "16.0"
+            _popup_pdf_off(_WORD_VERSION)               # supprime le popup de conversion
+        except Exception:
+            pass
+        _WORD_APP = app
+    return _WORD_APP
+
+
+def fermer_word():
+    """Ferme l'instance Word si elle a été ouverte (à appeler en fin de lot)."""
+    global _WORD_APP, _WORD_VERSION
+    if _WORD_APP is not None:
+        try:
+            _WORD_APP.Quit()
+        except Exception:
+            pass
+        _WORD_APP = None
+    if _WORD_VERSION is not None:
+        _popup_pdf_restaurer(_WORD_VERSION)             # remet Word dans son état initial
+        _WORD_VERSION = None
+
+
+def pdf_vers_docx(src_pdf, dst_docx):
+    """Convertit src_pdf -> dst_docx via Word. Retourne True si succès."""
+    try:
+        app = _word_app()
+    except ImportError:
+        print("  [pdf] pywin32 absent — `pip install pywin32` pour traiter les "
+              "PDF (Microsoft Word requis). PDF ignoré.")
+        return False
+    except Exception as e:
+        print(f"  [pdf] Microsoft Word indisponible ({e}). PDF ignoré.")
+        return False
+    doc = None
+    try:
+        # ConfirmConversions=False : supprime l'invite « convertir le PDF ».
+        # wdOpenFormatAuto=0 ; FileFormat 16 = wdFormatDocumentDefault (.docx).
+        doc = app.Documents.Open(os.path.abspath(src_pdf), ConfirmConversions=False,
+                                 ReadOnly=True, AddToRecentFiles=False, Visible=False)
+        doc.SaveAs2(os.path.abspath(dst_docx), FileFormat=16)
+        return True
+    except Exception as e:
+        print(f"  [pdf] échec de conversion de {os.path.basename(src_pdf)} : {e}")
+        return False
+    finally:
+        if doc is not None:
+            try:
+                doc.Close(SaveChanges=0)   # wdDoNotSaveChanges
+            except Exception:
+                pass
+
+
+def traiter_pdf(src, dst, termes, scrubbers, args):
+    """Convertit le PDF en .docx temporaire puis applique le traitement Office.
+    'dst' doit déjà porter l'extension .docx."""
+    import tempfile
+    tmp = tempfile.mktemp(suffix=".docx")
+    if not pdf_vers_docx(src, tmp):
+        NON_LUS.append(src)
+        return None
+    try:
+        return traiter_office(tmp, dst, termes, scrubbers, args)
+    finally:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
 
 
 # --------------------------------------------------------------------------- #
@@ -526,17 +810,20 @@ def _dst_unique(dst, utilises):
 def mode_scan(dossier, sortie_map, exclure=None):
     exclure = exclure or set()
     cand = Counter()
-    for racine, _, fichiers in os.walk(dossier):
-        for nom in fichiers:
-            ext = os.path.splitext(nom)[1].lower()
-            if ext in TEXT_EXT or ext in OFFICE_EXT:
-                texte = extraire_texte(os.path.join(racine, nom))
-                for m in RE_ACRONYME.findall(texte):
-                    cand[m] += 1
-                for m in RE_CAPS.findall(texte):
-                    tete = m.split()[0]
-                    if tete not in STOPWORDS and len(m) > 3:
+    try:
+        for racine, _, fichiers in os.walk(dossier):
+            for nom in fichiers:
+                ext = os.path.splitext(nom)[1].lower()
+                if ext in TEXT_EXT or ext in OFFICE_EXT or ext in PDF_EXT:
+                    texte = extraire_texte(os.path.join(racine, nom))
+                    for m in RE_ACRONYME.findall(texte):
                         cand[m] += 1
+                    for m in RE_CAPS.findall(texte):
+                        tete = m.split()[0]
+                        if tete not in STOPWORDS and len(m) > 3:
+                            cand[m] += 1
+    finally:
+        fermer_word()   # ferme Word si des PDF ont été lus
     # Filtre : >= 2 occurrences ET pas déjà connu du fichier de référence.
     retenus = sorted((c for c in cand.items()
                       if c[1] >= 2 and c[0].lower() not in exclure),
@@ -589,89 +876,54 @@ def verifier(sortie, paires, sensible_casse, verifier_noms=True):
 
 
 # --------------------------------------------------------------------------- #
-#  Main
+#  Cœur réutilisable (partagé par la ligne de commande ET le menu interactif)
 # --------------------------------------------------------------------------- #
-def main():
-    # Console Windows souvent en cp1252 : forcer l'UTF-8 en sortie évite un
-    # plantage (UnicodeEncodeError) sur les caractères ✅ / ⚠️ / accents.
-    for flux in (sys.stdout, sys.stderr):
-        try:
-            flux.reconfigure(encoding="utf-8")
-        except (AttributeError, ValueError):
-            pass
+def _dossier_app():
+    """Dossier de l'application : à côté de l'.exe si figé (PyInstaller),
+    sinon à côté du script .py. Sert à localiser le .tsv et le dossier Scan."""
+    if getattr(sys, "frozen", False):
+        return os.path.dirname(os.path.abspath(sys.executable))
+    return os.path.dirname(os.path.abspath(__file__))
 
-    p = argparse.ArgumentParser(
-        description="Anonymise par lot des documents .txt/.md/.docx/.pptx/.xlsx.")
-    p.add_argument("source", help="Dossier source contenant les documents.")
-    p.add_argument("--out", help="Dossier de sortie (obligatoire hors --scan, "
-                                 "doit être différent du source).")
-    p.add_argument("--map", help="Fichier de correspondances TSV "
-                                 "(original<TAB>remplacement).")
-    p.add_argument("--scan", action="store_true",
-                   help="Mode pré-remplissage : génère un fichier de "
-                        "correspondances et ne modifie rien.")
-    p.add_argument("--exclure", help="(mode --scan) Fichier de correspondances "
-                   "dont les termes connus seront EXCLUS des candidats générés.")
-    p.add_argument("--report", help="Chemin du rapport CSV "
-                                     "(défaut : <out>/_rapport_anonymisation.csv).")
-    p.add_argument("--case-sensitive", dest="sensible_casse", action="store_true",
-                   help="Respecte la casse (recommandé si un terme coïncide avec "
-                        "un mot courant, ex. l'adjectif « simplicité »).")
-    p.add_argument("--neutraliser-dates", action="store_true",
-                   help="Efface aussi les dates de création/modification Office.")
-    p.add_argument("--garder-suivi", action="store_true",
-                   help="Ne touche pas au suivi de modifications Word.")
-    p.add_argument("--garder-noms", action="store_true",
-                   help="Ne PAS anonymiser les noms de fichiers/dossiers "
-                        "(par défaut, les termes du .tsv y sont aussi appliqués).")
-    p.add_argument("--dry-run", action="store_true",
-                   help="Simule : compte les remplacements sans écrire les docs.")
-    # Désactivation des scrubbers techniques
-    p.add_argument("--no-email", action="store_true")
-    p.add_argument("--no-url", action="store_true")
-    p.add_argument("--no-ip", action="store_true")
-    p.add_argument("--no-mac", action="store_true")
-    p.add_argument("--no-port", action="store_true")
-    p.add_argument("--no-path", action="store_true")
-    args = p.parse_args()
 
-    if not os.path.isdir(args.source):
-        sys.exit(f"[erreur] dossier source introuvable : {args.source}")
+def _trouver_tsv(dossier):
+    """Renvoie (premier_tsv | None, [tous les .tsv triés par nom]) d'un dossier."""
+    fichiers = sorted(glob.glob(os.path.join(dossier, "*.tsv")),
+                      key=lambda p: os.path.basename(p).lower())
+    return (fichiers[0] if fichiers else None), fichiers
 
-    # --- Mode scan ---------------------------------------------------------- #
-    if args.scan:
-        # Sortie dans un sous-dossier "Scan" du dossier de ce script, peu importe
-        # d'où la commande est lancée. Un NOUVEAU fichier à chaque scan.
-        dossier_script = os.path.dirname(os.path.abspath(__file__))
-        scan_dir = os.path.join(dossier_script, "Scan")
-        os.makedirs(scan_dir, exist_ok=True)
-        nom_dossier = os.path.basename(os.path.normpath(args.source)) or "scan"
-        base = f"correspondances_{nom_dossier}.tsv"
-        # _chemin_unique garantit qu'aucun fichier existant n'est écrasé.
-        sortie_map = _chemin_unique(os.path.join(scan_dir, base))
-        # Exclut du scan les termes déjà présents dans le fichier de référence.
-        exclure = _charger_termes_existants(args.exclure) if args.exclure else set()
-        mode_scan(args.source, sortie_map, exclure)
-        _recap_non_lus()
-        return
 
-    # --- Mode anonymisation ------------------------------------------------- #
-    if not args.out:
-        sys.exit("[erreur] --out est obligatoire en mode anonymisation.")
-    if os.path.abspath(args.out) == os.path.abspath(args.source):
-        sys.exit("[erreur] le dossier de sortie doit être différent du source.")
-    if not args.map:
-        sys.exit("[erreur] --map est obligatoire (lance d'abord --scan pour le générer).")
+def lancer_scan(source, exclure_path=None):
+    """Scanne 'source' et écrit un nouveau correspondances_<dossier>.tsv dans le
+    sous-dossier 'Scan' de l'application. 'exclure_path' : .tsv dont les termes
+    connus sont exclus des candidats."""
+    scan_dir = os.path.join(_dossier_app(), "Scan")
+    os.makedirs(scan_dir, exist_ok=True)
+    nom_dossier = os.path.basename(os.path.normpath(source)) or "scan"
+    sortie_map = _chemin_unique(
+        os.path.join(scan_dir, f"correspondances_{nom_dossier}.tsv"))
+    exclure = _charger_termes_existants(exclure_path) if exclure_path else set()
+    mode_scan(source, sortie_map, exclure)
+    _recap_non_lus()
+    return sortie_map
 
-    paires = charger_correspondances(args.map)
+
+def anonymiser_dossier(source, out, map_path, opts, report=None):
+    """Cœur de l'anonymisation : charge 'map_path', traite tous les fichiers de
+    'source' vers 'out', écrit le rapport CSV et lance la vérification.
+
+    'opts' porte les attributs : sensible_casse, neutraliser_dates, garder_suivi,
+    garder_noms, dry_run, no_email, no_url, no_ip, no_mac, no_port, no_path.
+    """
+    paires = charger_correspondances(map_path)
     if not paires:
         print("[avert] aucune correspondance valide chargée — seuls les motifs "
               "techniques seront appliqués.")
-    termes = compiler_motifs_termes(paires, args.sensible_casse)
+    termes = compiler_motifs_termes(paires, opts.sensible_casse)
     # Pour les NOMS de fichiers : uniquement les termes littéraux (pas les regex).
     termes_noms = compiler_motifs_termes([p for p in paires if not p[2]],
-                                         args.sensible_casse)
-    scrubbers = construire_scrubbers(args)
+                                         opts.sensible_casse)
+    scrubbers = construire_scrubbers(opts)
 
     total = Counter()
     nb_fichiers = 0
@@ -679,36 +931,41 @@ def main():
     renommages = []
     dst_utilises = set()
 
-    for racine, _, fichiers in os.walk(args.source):
+    try:
+      for racine, _, fichiers in os.walk(source):
         for nom in fichiers:
             src = os.path.join(racine, nom)
             ext = os.path.splitext(nom)[1].lower()
-            rel = os.path.relpath(src, args.source)
+            rel = os.path.relpath(src, source)
 
             if ext in LEGACY_EXT:
                 print(f"  [ignoré] {rel} : format hérité .doc/.ppt — convertir en "
                       f".docx/.pptx d'abord.")
                 continue
-            if ext not in (TEXT_EXT | OFFICE_EXT):
+            if ext not in (TEXT_EXT | OFFICE_EXT | PDF_EXT):
                 continue
 
-            # Nom de sortie : anonymisé par défaut (sauf --garder-noms).
-            rel_out = rel if args.garder_noms else anonymiser_nom_relatif(rel, termes_noms)
-            dst = os.path.join(args.out, rel_out)
-            if not args.dry_run:
+            # Nom de sortie : anonymisé par défaut (sauf garder_noms).
+            rel_out = rel if opts.garder_noms else anonymiser_nom_relatif(rel, termes_noms)
+            # Un PDF est converti : sa sortie est un .docx anonymisé.
+            if ext in PDF_EXT:
+                rel_out = os.path.splitext(rel_out)[0] + ".docx"
+            dst = os.path.join(out, rel_out)
+            if not opts.dry_run:
                 dst = _dst_unique(dst, dst_utilises)
-                rel_out = os.path.relpath(dst, args.out)
+                rel_out = os.path.relpath(dst, out)
 
-            if args.dry_run:
-                # Compte uniquement
-                texte = extraire_texte(src)
+            if opts.dry_run:
+                texte = extraire_texte(src)   # gère .txt/.md/.docx/.pptx/.xlsx/.pdf
                 c = Counter()
                 remplacer_texte(texte, termes, scrubbers, c)
                 compteur = c
             elif ext in TEXT_EXT:
                 compteur = traiter_texte(src, dst, termes, scrubbers)
+            elif ext in PDF_EXT:
+                compteur = traiter_pdf(src, dst, termes, scrubbers, opts)
             else:
-                compteur = traiter_office(src, dst, termes, scrubbers, args)
+                compteur = traiter_office(src, dst, termes, scrubbers, opts)
             if compteur is None:   # fichier illisible / verrouillé : on saute
                 continue
 
@@ -718,15 +975,17 @@ def main():
                 renommages.append((rel, rel_out))
             for terme, n in sorted(compteur.items()):
                 rapport_lignes.append((rel_out, terme, n))
-            tag = "[simulé]" if args.dry_run else "[ok]"
+            tag = "[simulé]" if opts.dry_run else "[ok]"
             renom = f"  →  {rel_out}" if rel_out != rel else ""
             print(f"  {tag} {rel}{renom} — {sum(compteur.values())} remplacement(s)")
+    finally:
+        fermer_word()   # ferme Word si des PDF ont été traités
 
     # --- Rapport ------------------------------------------------------------ #
-    if not args.dry_run:
-        os.makedirs(args.out, exist_ok=True)
-    rapport = args.report or os.path.join(
-        args.out if not args.dry_run else os.getcwd(), "_rapport_anonymisation.csv")
+    if not opts.dry_run:
+        os.makedirs(out, exist_ok=True)
+    rapport = report or os.path.join(
+        out if not opts.dry_run else os.getcwd(), "_rapport_anonymisation.csv")
     with open(rapport, "w", encoding="utf-8", newline="") as f:
         w = csv.writer(f)
         w.writerow(["fichier", "terme_ou_motif", "occurrences_remplacees"])
@@ -747,9 +1006,9 @@ def main():
     print(f"Rapport : {rapport}")
 
     # --- Vérification ------------------------------------------------------- #
-    if not args.dry_run and paires:
-        survivants = verifier(args.out, paires, args.sensible_casse,
-                              verifier_noms=not args.garder_noms)
+    if not opts.dry_run and paires:
+        survivants = verifier(out, paires, opts.sensible_casse,
+                              verifier_noms=not opts.garder_noms)
         if survivants:
             print("\n⚠️  VÉRIFICATION : des termes interdits SUBSISTENT dans la "
                   "sortie (probable coupure entre runs Word) :")
@@ -770,13 +1029,263 @@ def main():
 
     # --- Récapitulatif des fichiers non lus --------------------------------- #
     _recap_non_lus()
-    if NON_LUS and not args.dry_run:
+    if NON_LUS and not opts.dry_run:
         with open(rapport, "a", encoding="utf-8", newline="") as f:
             w = csv.writer(f)
             w.writerow([])
             w.writerow(["FICHIERS NON LUS (absents du résultat)", "", ""])
             for c in sorted(set(NON_LUS)):
                 w.writerow([c, "", ""])
+
+
+def _opts_defaut():
+    """Objet d'options avec les valeurs par défaut (tout actif, rien d'exclu)."""
+    return types.SimpleNamespace(
+        sensible_casse=False, neutraliser_dates=False, garder_suivi=False,
+        garder_noms=False, garder_images=False, dry_run=False, no_email=False,
+        no_url=False, no_ip=False, no_mac=False, no_port=False, no_path=False)
+
+
+# --------------------------------------------------------------------------- #
+#  Menu interactif (équivalent du lanceur .bat, intégré pour l'.exe)
+# --------------------------------------------------------------------------- #
+def _saisir(prompt):
+    try:
+        return input(prompt).strip().strip('"')
+    except (EOFError, KeyboardInterrupt):
+        return ""
+
+
+def _oui(question):
+    return _saisir(question + " [o/N] : ").lower() == "o"
+
+
+def _pause():
+    _saisir("\nAppuyez sur Entrée pour continuer...")
+
+
+def _menu_scan(app):
+    print("\n" + "-" * 60)
+    print(" MODE SCAN")
+    print("-" * 60)
+    print(" Génère un correspondances_<dossier>.tsv dans le sous-dossier « Scan »")
+    print(" (à côté de l'application). Les termes déjà présents dans le .tsv de")
+    print(" référence sont exclus. Aucun document n'est modifié.")
+    src = _saisir("\nDossier à scanner : ")
+    if not src:
+        return
+    if not os.path.isdir(src):
+        print(f"[ERREUR] Dossier introuvable : {src}")
+        _pause()
+        return
+    ref, _ = _trouver_tsv(app)
+    lancer_scan(src, ref)
+    print("\nTerminé. Le .tsv généré est dans le sous-dossier « Scan ».")
+    print("Complète la 2e colonne, puis recopie les lignes utiles dans ton .tsv.")
+    _pause()
+
+
+def _menu_anon(app):
+    print("\n" + "-" * 60)
+    print(" MODE ANONYMISATION")
+    print("-" * 60)
+    src = _saisir("\nDossier SOURCE : ")
+    if not src:
+        return
+    if not os.path.isdir(src):
+        print(f"[ERREUR] Dossier source introuvable : {src}")
+        _pause()
+        return
+    out = _saisir("Dossier CIBLE (sortie, l'arborescence y sera recréée) : ")
+    if not out:
+        return
+    if os.path.abspath(out) == os.path.abspath(src):
+        print("[ERREUR] Le dossier de sortie doit être différent du source.")
+        _pause()
+        return
+
+    mapfile, liste = _trouver_tsv(app)
+    if not mapfile:
+        print(f"[ERREUR] Aucun fichier .tsv trouvé dans : {app}")
+        _pause()
+        return
+    if len(liste) > 1:
+        noms = ", ".join(os.path.basename(p) for p in liste)
+        print(f"\n[ATTENTION] {len(liste)} fichiers .tsv dans le dossier : {noms}")
+        print("            Le premier est utilisé -- vérifie que c'est le bon.")
+    import contextlib
+    import io
+    with contextlib.redirect_stdout(io.StringIO()):
+        nb = len(charger_correspondances(mapfile))
+    print(f"\nFichier de correspondances détecté automatiquement :")
+    print(f"   {os.path.basename(mapfile)}")
+    print(f"   -> {nb} correspondance(s) chargée(s).")
+
+    opts = _opts_defaut()
+    print("\n" + "-" * 60)
+    print(" Par DÉFAUT, le traitement va :")
+    print("   - remplacer les termes du .tsv (regex + termes exacts) ;")
+    print("   - masquer emails, URLs, IP, MAC, ports et chemins ;")
+    print("   - accepter le suivi de modifications Word, supprimer les commentaires ;")
+    print("   - SUPPRIMER entièrement les propriétés du document (auteur, société,")
+    print("     titres, propriétés custom) et neutraliser les horodatages internes ;")
+    print("   - SUPPRIMER les images et les objets OLE embarqués (Excel/Word collés) ;")
+    print("   - anonymiser AUSSI les noms de fichiers et de dossiers ;")
+    print("   - insensible à la casse et aux accents.")
+    print("-" * 60)
+    print("\n  [1] Lancer avec les options PAR DÉFAUT")
+    print("  [2] Configurer les options en détail")
+    if _saisir("Votre choix [1-2] : ") == "2":
+        opts.dry_run = _oui("Simulation, sans rien écrire (dry-run) ?")
+        opts.sensible_casse = _oui("Respecter la casse ?")
+        opts.garder_suivi = _oui("Garder le suivi de modifications Word ?")
+        opts.garder_noms = _oui("Garder les noms d'origine (ne PAS anonymiser les noms) ?")
+        opts.garder_images = _oui("Conserver les images ? (par défaut elles sont "
+                                  "SUPPRIMÉES ; si gardées, leurs métadonnées sont "
+                                  "strippées)")
+        scrub = _saisir("Désactiver nettoyages (E=email U=url I=ip P=port C=chemin "
+                        "M=mac) ou Entrée : ").upper()
+        opts.no_email = "E" in scrub
+        opts.no_url = "U" in scrub
+        opts.no_ip = "I" in scrub
+        opts.no_port = "P" in scrub
+        opts.no_path = "C" in scrub
+        opts.no_mac = "M" in scrub
+
+    print("\n" + "-" * 60)
+    print(" RÉCAPITULATIF")
+    print(f"   Source : {src}")
+    print(f"   Cible  : {out}")
+    print(f"   Map    : {os.path.basename(mapfile)} ({nb} correspondances)")
+    print("-" * 60)
+    if _saisir("Lancer maintenant ? [O/n] : ").lower() == "n":
+        return
+    print()
+    anonymiser_dossier(src, out, mapfile, opts)
+    _pause()
+
+
+def menu_interactif():
+    app = _dossier_app()
+    while True:
+        print("\n" + "=" * 60)
+        print("                ANONYMISEUR DE DOCUMENTS")
+        print("=" * 60)
+        print("\n  Formats traités : .txt .md .docx .pptx .xlsx .pdf\n")
+        print("  1. Scanner un dossier  (générer un fichier de correspondances)")
+        print("  2. Anonymiser un dossier")
+        print("  3. Quitter")
+        try:
+            choix = input("\nVotre choix [1-3] : ").strip()
+        except (EOFError, KeyboardInterrupt):
+            return   # fin de flux / Ctrl+C : on quitte proprement
+        if choix == "1":
+            _menu_scan(app)
+        elif choix == "2":
+            _menu_anon(app)
+        elif choix == "3":
+            return
+
+
+# --------------------------------------------------------------------------- #
+#  Main
+# --------------------------------------------------------------------------- #
+def main():
+    # Console Windows souvent en cp1252 : passer en UTF-8 (sortie + page de code)
+    # évite un plantage / des accents cassés sur ✅ / ⚠️ / é è à...
+    if os.name == "nt":
+        try:
+            import ctypes
+            ctypes.windll.kernel32.SetConsoleOutputCP(65001)
+            ctypes.windll.kernel32.SetConsoleCP(65001)
+        except Exception:
+            pass
+    for flux in (sys.stdout, sys.stderr):
+        try:
+            flux.reconfigure(encoding="utf-8")
+        except (AttributeError, ValueError):
+            pass
+
+    # Aucun argument (double-clic sur l'.exe, ou « python anonymiseur.py ») :
+    # on lance le menu interactif.
+    if len(sys.argv) == 1:
+        menu_interactif()
+        return
+
+    p = argparse.ArgumentParser(
+        description="Anonymise par lot des documents .txt/.md/.docx/.pptx/.xlsx/.pdf "
+                    "(.pdf : conversion via Word, nécessite pywin32).")
+    p.add_argument("source", nargs="?",
+                   help="Dossier source contenant les documents.")
+    p.add_argument("--out", help="Dossier de sortie (obligatoire hors --scan, "
+                                 "doit être différent du source).")
+    p.add_argument("--map", help="Fichier de correspondances TSV "
+                                 "(original<TAB>remplacement).")
+    p.add_argument("--scan", action="store_true",
+                   help="Mode pré-remplissage : génère un fichier de "
+                        "correspondances et ne modifie rien.")
+    p.add_argument("--exclure", help="(mode --scan) Fichier de correspondances "
+                   "dont les termes connus seront EXCLUS des candidats générés.")
+    p.add_argument("--report", help="Chemin du rapport CSV "
+                                     "(défaut : <out>/_rapport_anonymisation.csv).")
+    p.add_argument("--case-sensitive", dest="sensible_casse", action="store_true",
+                   help="Respecte la casse (recommandé si un terme coïncide avec "
+                        "un mot courant, ex. l'adjectif « simplicité »).")
+    p.add_argument("--neutraliser-dates", action="store_true",
+                   help="(sans effet : conservé pour compatibilité) Les "
+                        "propriétés du document — dates incluses — sont "
+                        "désormais TOUJOURS supprimées, et les horodatages "
+                        "internes de l'archive neutralisés.")
+    p.add_argument("--garder-suivi", action="store_true",
+                   help="Ne touche pas au suivi de modifications Word.")
+    p.add_argument("--garder-noms", action="store_true",
+                   help="Ne PAS anonymiser les noms de fichiers/dossiers "
+                        "(par défaut, les termes du .tsv y sont aussi appliqués).")
+    p.add_argument("--garder-images", action="store_true",
+                   help="Conserver les images des documents Office (leurs "
+                        "métadonnées EXIF/XMP/IPTC sont alors strippées). "
+                        "PAR DÉFAUT, les images sont SUPPRIMÉES.")
+    p.add_argument("--dry-run", action="store_true",
+                   help="Simule : compte les remplacements sans écrire les docs.")
+    p.add_argument("--compter", action="store_true",
+                   help="Affiche juste le nombre de correspondances valides de "
+                        "--map (sur stdout) puis quitte. Sert au lanceur .bat.")
+    # Désactivation des scrubbers techniques
+    p.add_argument("--no-email", action="store_true")
+    p.add_argument("--no-url", action="store_true")
+    p.add_argument("--no-ip", action="store_true")
+    p.add_argument("--no-mac", action="store_true")
+    p.add_argument("--no-port", action="store_true")
+    p.add_argument("--no-path", action="store_true")
+    args = p.parse_args()
+
+    # --- Mode comptage (pour le lanceur) : n'imprime QUE le nombre ---------- #
+    if args.compter:
+        if not args.map:
+            sys.exit("[erreur] --compter requiert --map.")
+        import io
+        import contextlib
+        with contextlib.redirect_stdout(io.StringIO()):   # tait les [avert]
+            paires = charger_correspondances(args.map)
+        print(len(paires))
+        return
+
+    if not args.source or not os.path.isdir(args.source):
+        sys.exit(f"[erreur] dossier source introuvable : {args.source}")
+
+    # --- Mode scan ---------------------------------------------------------- #
+    if args.scan:
+        lancer_scan(args.source, args.exclure)
+        return
+
+    # --- Mode anonymisation ------------------------------------------------- #
+    if not args.out:
+        sys.exit("[erreur] --out est obligatoire en mode anonymisation.")
+    if os.path.abspath(args.out) == os.path.abspath(args.source):
+        sys.exit("[erreur] le dossier de sortie doit être différent du source.")
+    if not args.map:
+        sys.exit("[erreur] --map est obligatoire (lance d'abord --scan pour le générer).")
+    anonymiser_dossier(args.source, args.out, args.map, args, args.report)
 
 
 if __name__ == "__main__":

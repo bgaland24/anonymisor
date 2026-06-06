@@ -32,7 +32,7 @@ echo ============================================================
 echo                ANONYMISEUR DE DOCUMENTS
 echo ============================================================
 echo.
-echo   Formats traites : .txt .md .docx .pptx .xlsx
+echo   Formats traites : .txt .md .docx .pptx .xlsx .pdf
 echo.
 echo   1. Scanner un dossier  (generer un fichier de correspondances)
 echo   2. Anonymiser un dossier
@@ -110,15 +110,32 @@ set /p "OUT=Dossier CIBLE (sortie, l'arborescence y sera recreee) : "
 if defined OUT set OUT=%OUT:"=%
 if not defined OUT goto menu
 
+rem --- Fichier de correspondances : 1er .tsv du dossier du .bat (auto) -----
 set "MAP="
-set /p "MAP=Fichier de correspondances (.tsv) : "
-if defined MAP set MAP=%MAP:"=%
-if not defined MAP goto menu
-if not exist "!MAP!" (
-    echo [ERREUR] Fichier de correspondances introuvable : "!MAP!"
+set "NBTSV=0"
+set "LISTE="
+for %%F in ("%~dp0*.tsv") do (
+    set /a NBTSV+=1
+    if not defined MAP set "MAP=%%~fF"
+    set "LISTE=!LISTE! %%~nxF"
+)
+if not defined MAP (
+    echo [ERREUR] Aucun fichier .tsv trouve dans le dossier du lanceur :
+    echo          "%~dp0"
     pause
     goto menu
 )
+if !NBTSV! GTR 1 (
+    echo.
+    echo [ATTENTION] !NBTSV! fichiers .tsv dans le dossier :!LISTE!
+    echo             Le PREMIER est utilise -- verifie que c'est le bon.
+)
+set "NB=?"
+for /f "delims=" %%C in ('python "%SCRIPT%" --compter --map "!MAP!" 2^>nul') do set "NB=%%C"
+echo.
+echo Fichier de correspondances detecte automatiquement :
+echo    "!MAP!"
+echo    -^> !NB! correspondance(s) chargee(s).
 
 set "OPTS="
 
@@ -128,13 +145,15 @@ echo  Par DEFAUT, le traitement va :
 echo    - remplacer les termes du .tsv (regex + termes exacts) ;
 echo    - masquer emails, URLs, IP, MAC, ports et chemins ;
 echo    - accepter le suivi de modifications Word, supprimer les commentaires ;
-echo    - nettoyer les metadonnees Office (auteur, societe...) ;
+echo    - SUPPRIMER entierement les proprietes du document (auteur, societe,
+echo      titres, proprietes custom) et neutraliser les horodatages internes ;
+echo    - SUPPRIMER les images et les objets OLE embarques (Excel/Word colles) ;
 echo    - anonymiser AUSSI les noms de fichiers et de dossiers ;
-echo    - conserver les dates Office ; insensible a la casse et aux accents.
+echo    - insensible a la casse et aux accents.
 echo ------------------------------------------------------------
 echo.
 echo   [1] Lancer avec les options PAR DEFAUT
-echo   [2] Configurer les options en detail (dry-run, casse, dates, noms...)
+echo   [2] Configurer les options en detail (dry-run, casse, images, noms...)
 echo.
 set "MODE="
 set /p "MODE=Votre choix [1-2] : "
@@ -148,9 +167,12 @@ set "ANS="
 set /p "ANS=Respecter la casse (--case-sensitive) ? [o/N] : "
 if /i "!ANS!"=="o" set "OPTS=!OPTS! --case-sensitive"
 
+echo.
+echo Par defaut, les images sont SUPPRIMEES (si gardees, leurs metadonnees
+echo sont strippees mais leur contenu visuel n'est PAS anonymise).
 set "ANS="
-set /p "ANS=Effacer aussi les dates Office (--neutraliser-dates) ? [o/N] : "
-if /i "!ANS!"=="o" set "OPTS=!OPTS! --neutraliser-dates"
+set /p "ANS=Conserver les images (--garder-images) ? [o/N] : "
+if /i "!ANS!"=="o" set "OPTS=!OPTS! --garder-images"
 
 set "ANS="
 set /p "ANS=Garder le suivi de modifications Word (--garder-suivi) ? [o/N] : "
